@@ -1,5 +1,8 @@
+from typing import Union
+
 import torch
 from fastapi import FastAPI, HTTPException, Response
+from pydantic import BaseModel
 from PIL import Image
 from io import BytesIO
 from diffusers.image_processor import VaeImageProcessor
@@ -7,6 +10,7 @@ from model.pipeline import CatVTONPipeline
 from model.cloth_masker import AutoMasker
 from vton_utils import resize_and_crop, resize_and_padding, init_weight_dtype
 from google.cloud import storage
+from google.cloud import secretmanager_v1
 from Crypto.Cipher import AES
 import os
 import logging
@@ -20,20 +24,34 @@ WIDTH, HEIGHT = 768, 1024
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 MIXED_PRECISION = "bf16"
 USE_TF32 = True
-MODELS_BUCKET_NAME = "style-me-models"  # Your GCS bucket name
-IMAGES_BUCKET_NAME = "style-me-image"  # Your GCS bucket name
-AES_KEY = bytes.fromhex(os.getenv("AES_256").strip())  # Replace with your 32-byte AES key
-LOCAL_MODEL_DIR = "/tmp/models"  # Temporary directory for model storage
+MODELS_BUCKET_NAME = "style-me-models"
+IMAGES_BUCKET_NAME = "style-me-image"
+SECRET_PROJECT_ID = "870021534924"
+SECRET_ID = "AES_256"
+LOCAL_MODEL_DIR = "/tmp/models"
 
-# Google Cloud Storage client
 storage_client = storage.Client()
+secret_client = secretmanager_v1.SecretManagerServiceClient()
 
-# Global variables for pipeline and masker (to be initialized later)
 pipeline = None
 automasker = None
 vae_processor = None
 mask_processor = None
+AES_KEY = None
 
+def get_secret(secret_id: str, project_id: str) -> bytes:
+    try:
+        secret_name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
+        response = secret_client.access_secret_version(request={"name": secret_name})
+        secret_value = response.payload.data.decode("UTF-8").strip()
+        aes_key = bytes.fromhex(secret_value)
+        if len(aes_key) != 32:
+            raise ValueError(f"AES key must be 32 bytes, got {len(aes_key)} bytes")
+        logger.info("Successfully retrieved AES key from Secret Manager")
+        return aes_key
+    except Exception as e:
+        logger.error(f"Failed to retrieve secret: {str(e)}")
+        raise
 
 def download_from_gcs(bucket_name, source_path, local_path):
     bucket = storage_client.bucket(bucket_name)
@@ -47,17 +65,15 @@ def download_from_gcs(bucket_name, source_path, local_path):
         blob.download_to_filename(local_file_path)
         logger.info(f"Downloaded {blob.name} to {local_file_path}")
 
-
-# Startup event to download models and initialize pipeline
 @app.on_event("startup")
 async def startup_event():
-    global pipeline, automasker, vae_processor, mask_processor
+    global pipeline, automasker, vae_processor, mask_processor, AES_KEY
 
-    # Define model paths
+    AES_KEY = get_secret(SECRET_ID, SECRET_PROJECT_ID)
+
     sd_path = f"{LOCAL_MODEL_DIR}/stable-diffusion-inpainting"
     catvton_path = f"{LOCAL_MODEL_DIR}/catvton"
 
-    # Check if models already exist
     models_exist = os.path.exists(sd_path) and os.path.exists(catvton_path)
 
     if not models_exist:
@@ -68,7 +84,6 @@ async def startup_event():
     else:
         logger.info("Models already exist in /tmp/models, skipping download.")
 
-    # Initialize CatVTON Pipeline
     try:
         logger.info("Initializing CatVTON Pipeline...")
         pipeline = CatVTONPipeline(
@@ -103,7 +118,6 @@ async def startup_event():
 
     logger.info("Startup completed successfully.")
 
-
 def fetch_image_from_gcs(image_id: str) -> bytes:
     logger.info(f"Fetching image from GCS: {image_id}")
     bucket = storage_client.bucket(IMAGES_BUCKET_NAME)
@@ -111,7 +125,6 @@ def fetch_image_from_gcs(image_id: str) -> bytes:
     data = blob.download_as_bytes()
     logger.info(f"Fetched data length: {len(data)}, first 32 bytes: {data[:32].hex()}")
     return data
-
 
 def decode_image(encrypted_data: bytes) -> bytes:
     nonce = encrypted_data[:16]
@@ -124,13 +137,11 @@ def decode_image(encrypted_data: bytes) -> bytes:
         raise Exception("Decryption failed: The data is corrupted or the tag is invalid.") from e
     return decrypted_data
 
-
 def encode_image(image_data: bytes) -> bytes:
     cipher = AES.new(AES_KEY, AES.MODE_GCM)
     ciphertext, tag = cipher.encrypt_and_digest(image_data)
     encrypted_data = cipher.nonce + tag + ciphertext
     return encrypted_data
-
 
 def preprocess_image(img: Image.Image, is_cloth: bool = False) -> torch.Tensor:
     if is_cloth:
@@ -139,18 +150,15 @@ def preprocess_image(img: Image.Image, is_cloth: bool = False) -> torch.Tensor:
         img = resize_and_crop(img, (WIDTH, HEIGHT))
     return vae_processor.preprocess(img, HEIGHT, WIDTH)[0]
 
-
 def preprocess_mask(mask: Image.Image) -> torch.Tensor:
     mask = resize_and_crop(mask, (WIDTH, HEIGHT))
     return mask_processor.preprocess(mask, HEIGHT, WIDTH)[0]
 
-
 def image_to_bytes(img: Image.Image) -> BytesIO:
     buffered = BytesIO()
-    img.save(buffered, format="PNG")
+    img.save(buffered, format="WEBP")
     buffered.seek(0)
     return buffered
-
 
 def run_inference(person_img: Image.Image, cloth_img: Image.Image, cloth_type: str, inference_steps: int) -> Image.Image:
     person_img_processed = resize_and_crop(person_img, (WIDTH, HEIGHT))
@@ -180,90 +188,84 @@ def run_inference(person_img: Image.Image, cloth_img: Image.Image, cloth_type: s
         )[0]
     return result
 
+class PredictRequest(BaseModel):
+    person_image_id: str
+    cloth_upper_image_id: Union[str, None] = None
+    cloth_lower_image_id: Union[str, None] = None
+    cloth_overall_image_id: Union[str, None] = None
+    inference_steps: int = 20
+
+@app.get("/health")
+async def health():
+    return {"status": "OK"}
 
 @app.post("/predict")
-async def predict(
-        person_image_id: str,
-        cloth_upper_image_id: str = None,
-        cloth_lower_image_id: str = None,
-        cloth_overall_image_id: str = None,
-        inference_steps: int = 20
-):
+async def predict(request: PredictRequest):
     try:
         logger.info(
-            f"Received request: person_image_id={person_image_id}, cloth_upper_image_id={cloth_upper_image_id}, "
-            f"cloth_lower_image_id={cloth_lower_image_id}, cloth_overall_image_id={cloth_overall_image_id}")
+            f"Received request: person_image_id={request.person_image_id}, cloth_upper_image_id={request.cloth_upper_image_id}, "
+            f"cloth_lower_image_id={request.cloth_lower_image_id}, cloth_overall_image_id={request.cloth_overall_image_id}")
 
-        # Validate clothing ID logic
-        cloth_ids = [cloth_upper_image_id, cloth_lower_image_id, cloth_overall_image_id]
+        cloth_ids = [request.cloth_upper_image_id, request.cloth_lower_image_id, request.cloth_overall_image_id]
         provided_cloth_ids = [cid for cid in cloth_ids if cid is not None]
 
         if len(provided_cloth_ids) == 0:
             raise HTTPException(status_code=400, detail="At least one cloth ID must be provided")
 
-        # If overall ID is provided, upper and lower IDs must not be present
-        if cloth_overall_image_id and (cloth_upper_image_id or cloth_lower_image_id):
+        if request.cloth_overall_image_id and (request.cloth_upper_image_id or request.cloth_lower_image_id):
             raise HTTPException(status_code=400, detail="Overall cloth ID cannot be combined with upper or lower IDs")
 
-        # Ensure pipeline and automasker are initialized
         if pipeline is None or automasker is None:
             logger.error("Pipeline or automasker not initialized")
             raise HTTPException(status_code=503, detail="Service not ready: Models are still loading")
 
-        # Fetch and decode person image
-        logger.info(f"Fetching person image: {person_image_id}")
-        person_data_encrypted = fetch_image_from_gcs(person_image_id)
+        logger.info(f"Fetching person image: {request.person_image_id}")
+        person_data_encrypted = fetch_image_from_gcs(request.person_image_id)
         logger.info("Decoding person image")
         person_data = decode_image(person_data_encrypted)
         person_img = Image.open(BytesIO(person_data)).convert("RGB")
 
-        # Handle inference based on provided cloth IDs
-        result = person_img  # Start with the original person image
+        result = person_img
 
-        # Case 1: Only overall cloth ID
-        if cloth_overall_image_id:
-            logger.info(f"Fetching overall cloth image: {cloth_overall_image_id}")
-            cloth_data_encrypted = fetch_image_from_gcs(cloth_overall_image_id)
+        if request.cloth_overall_image_id:
+            logger.info(f"Fetching overall cloth image: {request.cloth_overall_image_id}")
+            cloth_data_encrypted = fetch_image_from_gcs(request.cloth_overall_image_id)
             logger.info("Decoding overall cloth image")
             cloth_data = decode_image(cloth_data_encrypted)
             cloth_img = Image.open(BytesIO(cloth_data)).convert("RGB")
             logger.info("Running inference for overall cloth")
-            result = run_inference(result, cloth_img, "overall", inference_steps)
+            result = run_inference(result, cloth_img, "overall", request.inference_steps)
 
-        # Case 2: Upper and/or lower cloth IDs
-        elif cloth_upper_image_id or cloth_lower_image_id:
-            if cloth_upper_image_id and cloth_lower_image_id:
-                inference_steps = 15
-            if cloth_upper_image_id:
-                logger.info(f"Fetching upper cloth image: {cloth_upper_image_id}")
-                cloth_data_encrypted = fetch_image_from_gcs(cloth_upper_image_id)
+        elif request.cloth_upper_image_id or request.cloth_lower_image_id:
+            if request.cloth_upper_image_id and request.cloth_lower_image_id:
+                request.inference_steps = 15
+            if request.cloth_upper_image_id:
+                logger.info(f"Fetching upper cloth image: {request.cloth_upper_image_id}")
+                cloth_data_encrypted = fetch_image_from_gcs(request.cloth_upper_image_id)
                 logger.info("Decoding upper cloth image")
                 cloth_data = decode_image(cloth_data_encrypted)
                 cloth_img = Image.open(BytesIO(cloth_data)).convert("RGB")
                 logger.info("Running inference for upper cloth")
-                result = run_inference(result, cloth_img, "upper", inference_steps)
+                result = run_inference(result, cloth_img, "upper", request.inference_steps)
 
-            # Second inference: Lower cloth if provided, using result from upper (or original if no upper)
-            if cloth_lower_image_id:
-                logger.info(f"Fetching lower cloth image: {cloth_lower_image_id}")
-                cloth_data_encrypted = fetch_image_from_gcs(cloth_lower_image_id)
+            if request.cloth_lower_image_id:
+                logger.info(f"Fetching lower cloth image: {request.cloth_lower_image_id}")
+                cloth_data_encrypted = fetch_image_from_gcs(request.cloth_lower_image_id)
                 logger.info("Decoding lower cloth image")
                 cloth_data = decode_image(cloth_data_encrypted)
                 cloth_img = Image.open(BytesIO(cloth_data)).convert("RGB")
                 logger.info("Running inference for lower cloth")
-                result = run_inference(result, cloth_img, "lower", inference_steps)
+                result = run_inference(result, cloth_img, "lower", request.inference_steps)
 
-        # Convert result to WEBP bytes (unencrypted)
-        logger.info("Converting result to WEBP")
-        webp_buffer = BytesIO()
-        result.save(webp_buffer, format="WEBP")
+        logger.info("Converting result to WEBP and encrypting")
+        webp_buffer = image_to_bytes(result)
         webp_bytes = webp_buffer.getvalue()
+        encrypted_webp_bytes = encode_image(webp_bytes)
 
-        # Return as unencrypted WEBP image
         return Response(
-            content=webp_bytes,
-            media_type="image/webp",
-            headers={"Content-Disposition": "attachment; filename=result.webp"}
+            content=encrypted_webp_bytes,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": "attachment; filename=result_encrypted.webp"}
         )
 
     except Exception as e:
