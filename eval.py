@@ -8,7 +8,7 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchvision import transforms
 from tqdm import tqdm
 
-from utils import scan_files_in_dir
+from vton_utils import scan_files_in_dir
 from prettytable import PrettyTable
 
 class EvalDataset(Dataset):

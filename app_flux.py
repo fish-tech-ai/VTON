@@ -11,7 +11,7 @@ from PIL import Image
 
 from model.cloth_masker import AutoMasker, vis_mask
 from model.flux.pipeline_flux_tryon import FluxTryOnPipeline
-from utils import resize_and_crop, resize_and_padding
+from vton_utils import resize_and_crop, resize_and_padding
 
 def parse_args():
     parser = argparse.ArgumentParser(description="FLUX Try-On Demo")

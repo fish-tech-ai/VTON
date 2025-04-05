@@ -5,7 +5,7 @@ from io import BytesIO
 from diffusers.image_processor import VaeImageProcessor
 from model.pipeline import CatVTONPipeline
 from model.cloth_masker import AutoMasker
-from utils import resize_and_crop, resize_and_padding, init_weight_dtype
+from vton_utils import resize_and_crop, resize_and_padding, init_weight_dtype
 from google.cloud import storage
 from Crypto.Cipher import AES
 import os
