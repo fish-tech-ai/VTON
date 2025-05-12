@@ -119,10 +119,13 @@ async def startup_event():
     logger.info("Startup completed successfully.")
 
 
-def fetch_image_from_gcs(image_id: str) -> bytes:
+def fetch_image_from_gcs(image_id: str, user_id: str, is_cloth_data: bool = True) -> bytes:
     logger.info(f"Fetching image from GCS: {image_id}")
-    bucket = storage_client.bucket(IMAGES_BUCKET_NAME)
-    blob = bucket.blob(f"{image_id}.WEBP")
+    bucket = storage_client.bucket(f"{IMAGES_BUCKET_NAME}")
+    if is_cloth_data:
+        blob = bucket.blob(f"garment-images-full/{user_id}/{image_id}.WEBP")
+    else:
+        blob = bucket.blob(f"model-images-full/{user_id}/{image_id}.WEBP")
     data = blob.download_as_bytes()
     logger.info(f"Fetched data length: {len(data)}, first 32 bytes: {data[:32].hex()}")
     return data
@@ -280,7 +283,7 @@ async def predict(request: VertexRequest):
             raise HTTPException(status_code=503, detail="Service not ready: Models are still loading")
 
         logger.info(f"Fetching person image: {instance.person_image_id}")
-        person_data_encrypted = fetch_image_from_gcs(instance.person_image_id)
+        person_data_encrypted = fetch_image_from_gcs(instance.person_image_id, instance.user_id, False)
         logger.info("Decoding person image")
         person_data = decode_image(person_data_encrypted)
         person_img = Image.open(BytesIO(person_data)).convert("RGB")
@@ -288,7 +291,7 @@ async def predict(request: VertexRequest):
 
         if instance.cloth_overall_image_id:
             logger.info(f"Fetching overall cloth image: {instance.cloth_overall_image_id}")
-            cloth_data_encrypted = fetch_image_from_gcs(instance.cloth_overall_image_id)
+            cloth_data_encrypted = fetch_image_from_gcs(instance.cloth_overall_image_id, instance.user_id)
             logger.info("Decoding overall cloth image")
             cloth_data = decode_image(cloth_data_encrypted)
             cloth_img = Image.open(BytesIO(cloth_data)).convert("RGB")
@@ -299,7 +302,7 @@ async def predict(request: VertexRequest):
                 instance.inference_steps = 15
             if instance.cloth_upper_image_id:
                 logger.info(f"Fetching upper cloth image: {instance.cloth_upper_image_id}")
-                cloth_data_encrypted = fetch_image_from_gcs(instance.cloth_upper_image_id)
+                cloth_data_encrypted = fetch_image_from_gcs(instance.cloth_upper_image_id, instance.user_id)
                 logger.info("Decoding upper cloth image")
                 cloth_data = decode_image(cloth_data_encrypted)
                 cloth_img = Image.open(BytesIO(cloth_data)).convert("RGB")
@@ -307,7 +310,7 @@ async def predict(request: VertexRequest):
                 result = run_inference(result, cloth_img, "upper", instance.inference_steps)
             if instance.cloth_lower_image_id:
                 logger.info(f"Fetching lower cloth image: {instance.cloth_lower_image_id}")
-                cloth_data_encrypted = fetch_image_from_gcs(instance.cloth_lower_image_id)
+                cloth_data_encrypted = fetch_image_from_gcs(instance.cloth_lower_image_id, instance.user_id)
                 logger.info("Decoding lower cloth image")
                 cloth_data = decode_image(cloth_data_encrypted)
                 cloth_img = Image.open(BytesIO(cloth_data)).convert("RGB")
