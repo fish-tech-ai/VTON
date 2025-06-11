@@ -1,5 +1,22 @@
 # Dokumentacja techniczna systemu CatVTON do wirtualnego przymierzania odzieży
 
+## Instalacja
+
+Utworzenie źrodowiska Conda i instalacja zależności:
+```shell
+conda create -n catvton python==3.9.0
+conda activate catvton
+cd CatVTON-main  # or your path to CatVTON project dir
+pip install -r requirements.txt
+```
+
+## Uruchomienie lokalnie (wymaga zainstalowanych sterowników CUDA 12.1)
+```shell
+uvicorn serving:app --host 0.0.0.0 --port 5000
+```
+
+
+
 ## 1. Streszczenie
 System CatVTON to rozwiązanie do generowania fotorealistycznych wizualizacji przymierzania odzieży w czasie rzeczywistym, wykorzystujące zaawansowane modele głębokiego uczenia. Dokument opisuje architekturę, interfejsy oraz mechanizmy działania systemu.
 
@@ -44,13 +61,6 @@ System CatVTON to rozwiązanie do generowania fotorealistycznych wizualizacji pr
 #### Wymagania:
 - Co najmniej jeden parametr `cloth_*_image_id` musi być określony
 - Wzajemnie wykluczające się: `cloth_overall_image_id` i pozostałe typy odzieży
-
-#### Odpowiedź:
-```json
-{
-  "predictions": ["base64_encoded_image"]
-}
-```
 
 ## 4. Mechanizmy przetwarzania
 
